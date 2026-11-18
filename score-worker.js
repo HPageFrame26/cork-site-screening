@@ -41,6 +41,8 @@ var NATIONAL_ROAD_M = 40;         // a national road this close is flagged as an
 var UNUSED_PERMISSION_M = 150;
 var STEEP_PCT = 15;               // ground steeper than this (about 1 in 7) is not counted as developable
 var TOWN_RADIUS_M = 3000;         // a site this close to a plan town is counted against that town's housing target
+var NARROW_M = 20;                 // a parcel with a mean width under this is a strip, not an estate site
+var CAP_NARROW = 40;               // ceiling for a narrow strip
 var OPEN_MAX_IN_USE_PCT = 30;      // a parcel with this share or more in another active use is not open land
 var OPEN_MAX_BUILDINGS = 1, OPEN_MAX_COVER_PCT = 2, OPEN_MAX_ROAD_POINTS = 2;  // a parcel counts as open land below these
 
@@ -97,7 +99,7 @@ function esc(s) { return String(s == null ? '' : s).replace(/[&<>"]/g, function 
 function link(url, text) { return url ? '<a href="' + esc(url) + '" target="_blank" rel="noopener">' + esc(text) + '</a>' : esc(text); }
 function self_id(r) { return r; }
 
-var boundary = [], zoning = [], flood = [], prot = [], water = { waste: [], supply: [] }, pts = {}, planning = [], market = {}, towns = [], monuments = [], mgrid = {}, ngrid = {}, stateland = [], inuse = [], meta = { layers: {} };
+var boundary = [], zoning = [], flood = [], prot = [], water = { waste: [], supply: [] }, pts = {}, planning = [], market = {}, towns = [], monuments = [], mgrid = {}, ngrid = {}, grid = {}, stateland = [], inuse = [], meta = { layers: {} };
 
 // ---------- factors: each returns {score, summary, evidence, cap?} ----------
 function zoneScore(code) {
@@ -226,8 +228,36 @@ function scoreMarket(p) {
   out.evidence = bits.join(' ');
   return out;
 }
+// Electricity: spare demand capacity at the nearest substation with a medium-voltage connection (ESB Networks workbook).
+// GRID_MARKS: firm capacity this year of at least [MVA] earns [mark]. The marks and the distance rule are assumptions.
+var GRID_MARKS = [[5, 100], [2, 85], [0.5, 65], [0.01, 45]];
+var GRID_NONFIRM_ONLY = 30;        // no firm capacity, but non-firm capacity is shown
+var GRID_COMING = 40;              // no firm capacity now, but at least 0.5 MVA shown for the last year in the data
+var GRID_NONE = 15;                // no capacity shown at all
+var GRID_FAR_M = 8000, GRID_FAR_PENALTY = 20;   // nearest substation further than this loses marks
+function mva(v) { return (v == null ? 'not given' : v.toFixed(1) + ' MVA'); }
+function scoreGrid(p) {
+  var n = nearest(grid.stations || [], p, function (r) { return r.ll; });
+  if (!n) return { score: null, summary: 'No data', evidence: 'Capacity data not loaded.' };
+  var s = n.item, y = grid.years, f = s.firm[0] || 0, nf = s.nonfirm[0] || 0, later = s.firm[s.firm.length - 1] || 0, mark = null, summary;
+  GRID_MARKS.forEach(function (g) { if (mark == null && f >= g[0]) mark = g[1]; });
+  if (mark != null) summary = f.toFixed(1) + ' MVA spare at ' + s.name;
+  else if (later >= 0.5) { mark = GRID_COMING; summary = 'None spare now at ' + s.name + ', ' + later.toFixed(1) + ' MVA by ' + y[y.length - 1]; }
+  else if (nf > 0) { mark = GRID_NONFIRM_ONLY; summary = 'Non-firm capacity only at ' + s.name; }
+  else { mark = GRID_NONE; summary = 'No spare capacity at ' + s.name; }
+  var far = n.d > GRID_FAR_M;
+  if (far) mark = Math.max(10, mark - GRID_FAR_PENALTY);
+  var ev = 'Nearest substation with a medium-voltage connection: <b>' + esc(s.name) + '</b> (' + esc(s.level.replace(' KV', ' kV')) + ', connection at ' + s.kv + ' kV), ' + km(n.d) + ' from the pin' +
+    (far ? ', which is more than ' + km(GRID_FAR_M) + ' and takes ' + GRID_FAR_PENALTY + ' off the mark' : '') + '.' +
+    '<table class="mini"><tr><th>Spare demand capacity</th>' + y.map(function (v) { return '<th class="num">' + v + '</th>'; }).join('') + '</tr>' +
+    '<tr><td>Firm</td>' + s.firm.map(function (v) { return '<td class="num">' + mva(v) + '</td>'; }).join('') + '</tr>' +
+    '<tr><td>Non-firm</td>' + s.nonfirm.map(function (v) { return '<td class="num">' + mva(v) + '</td>'; }).join('') + '</tr></table>' +
+    'Source: ESB Networks Demand Capacity Headroom Report 2025, version ' + esc(grid.version || '') + ', ' + esc(grid.scenario || '') + ' scenario. ' + link('https://esbnetworks.ie/services/tools-maps/capacity-workbooks', 'Workbook') + '. ' +
+    'ESB describes the figures as indicative transformer headroom. They do not show capacity further up the network, the nearest substation may not be the one that would serve the site, and every connection needs ESB\'s own study.';
+  return { score: mark, summary: summary, evidence: ev, grid: { name: s.name, firm: f, later: later, d: n.d } };
+}
 var FACTORS = [['zoning', 'Zoning', scoreZoning], ['flood', 'Flood', scoreFlood], ['waste', 'Wastewater', scoreWaste], ['supply', 'Water supply', scoreSupply],
-  ['market', 'Market values', scoreMarket], ['protected', 'Protected sites', scoreProtected], ['access', 'Access and services', scoreAccess], ['planning', 'Comparable schemes', scorePlanning]];
+  ['market', 'Market values', scoreMarket], ['protected', 'Protected sites', scoreProtected], ['access', 'Access and services', scoreAccess], ['grid', 'Electricity', scoreGrid], ['planning', 'Comparable schemes', scorePlanning]];
 
 // ---------- what already stands on the land ----------
 var bgrid = {}, BCELL = 0.004, candidates = [];
@@ -266,6 +296,31 @@ function parcelInfo(q) {
     mon: q.mon || [0], nat: q.nat || '', state: q.state || '', use: q.use || [0, ''], cn: q.cn || null, open: (q.use ? q.use[0] : 0) < OPEN_MAX_IN_USE_PCT && q.nb <= OPEN_MAX_BUILDINGS && q.built < OPEN_MAX_COVER_PCT && (q.nr || 0) <= OPEN_MAX_ROAD_POINTS && !q.cn };
 }
 
+// Mean width of a parcel in metres: twice the area divided by the perimeter. For a long strip this is close to its width.
+function meanWidth(f) {
+  var g = f.geometry, polys = g.type === 'Polygon' ? [g.coordinates] : g.coordinates, per = 0;
+  polys.forEach(function (poly) { poly.forEach(function (ring) { for (var i = 0; i < ring.length - 1; i++) per += dist(ring[i], ring[i + 1]); }); });
+  return per ? Math.round(2 * f.properties.ha * 10000 / per) : null;
+}
+// Why a parcel does not count as open land, or null if it does. A possibly stalled start is left alone so it can be listed.
+function notOpenWhy(i) {
+  if (i.use[0] >= OPEN_MAX_IN_USE_PCT) return i.use[0] + '% of the parcel is in use as a ' + i.use[1] + ', according to OpenStreetMap';
+  if (i.cn && i.cn.stalled && i.built < 5) return null;
+  if (i.cn) return 'construction of ' + i.cn.u + ' homes started on this parcel in ' + i.cn.y + ' (commencement notice)';
+  if (i.nb > OPEN_MAX_BUILDINGS || i.built >= OPEN_MAX_COVER_PCT) return i.nb + ' buildings already stand on the parcel, covering ' + i.built + '% of it';
+  if (i.nr > OPEN_MAX_ROAD_POINTS) return 'a residential street already runs through the parcel';
+  return null;
+}
+// The caps that apply to a parcel as a whole. Used for the list and for any pin inside the parcel, so both always agree.
+function parcelCaps(caps, info, m) {
+  caps = caps.filter(function (c) { return c.key !== 'flood' && c.key !== 'protected' && c.key !== 'monument' && c.key !== 'built'; });
+  if (m.clearPct < 25) caps.push({ limit: CAP_RULED_OUT, why: 'only ' + m.clearPct + '% of the parcel is clear of flood extents, designated sites and steep ground', key: 'net' });
+  var why = notOpenWhy(info);
+  if (why) caps.push({ limit: CAP_BUILT, why: why, key: 'built' });
+  if (m.widthM != null && m.widthM < NARROW_M) caps.push({ limit: CAP_NARROW, why: 'the parcel is a narrow strip, about ' + m.widthM + ' m wide on average, which is unlikely to take a road with houses', key: 'narrow' });
+  return caps;
+}
+
 // Measure a parcel across all its sample points: how much is flooded, protected or steep, and what is left.
 function measureParcel(f) {
   var q = f.properties, ptsIn = q.pts && q.pts.length ? q.pts : [q.rep], wet = 0, lowWet = 0, prot_ = 0, steep = 0, monu = 0, used = 0, clear = 0, firstClear = null;
@@ -283,7 +338,7 @@ function measureParcel(f) {
   var n = ptsIn.length, o = q.obj || { lo: 25, hi: 45 }, share = clear / n, netHa = q.ha * share;
   var repBad = hits(flood, q.rep).some(function (h) { return h.properties.prob === 'medium'; }) || hits(prot, q.rep).some(function (h) { return h.properties.t !== 'pnha'; });
   return { n: n, floodPct: Math.round(100 * wet / n), lowFloodPct: Math.round(100 * lowWet / n), protPct: Math.round(100 * prot_ / n), steepPct: Math.round(100 * steep / n), monPct: Math.round(100 * monu / n), usePct: Math.round(100 * used / n),
-    clearPct: Math.round(100 * share), netHa: Math.round(netHa * 100) / 100, homesLo: Math.round(netHa * o.lo), homesHi: Math.round(netHa * o.hi),
+    widthM: meanWidth(f), clearPct: Math.round(100 * share), netHa: Math.round(netHa * 100) / 100, homesLo: Math.round(netHa * o.lo), homesHi: Math.round(netHa * o.hi),
     homes: Math.round(netHa * (o.lo + o.hi) / 2), rep: repBad && firstClear ? [firstClear[0], firstClear[1]] : q.rep };
 }
 function gridNear(grid, p, metres) {
@@ -297,6 +352,8 @@ function gridNear(grid, p, metres) {
 // Things a developer would check next. They are shown on the scorecard and are not part of the mark, except the monument cap.
 function pinNotes(p, out) {
   var notes = [];
+  var gf = out.factors.filter(function (x) { return x.key === 'grid'; })[0];
+  if (gf && gf.grid && !gf.grid.firm) notes.push('<b>Electricity:</b> the nearest substation, ' + esc(gf.grid.name) + ' (' + km(gf.grid.d) + ' away), shows no spare firm capacity this year' + (gf.grid.later >= 0.5 ? ', with ' + gf.grid.later.toFixed(1) + ' MVA shown for ' + grid.years[grid.years.length - 1] : '') + '. Ask ESB Networks about a connection early.');
   var mons = gridNear(mgrid, p, MONUMENT_NEAR_M);
   if (mons.length) {
     var m = mons[0];
@@ -333,11 +390,21 @@ function score(p, forParcel) {
   var pl = nearest(pts.places || [], p, self_id);
   out.place = pl ? { name: pl.item[2], d: Math.round(pl.d) } : null;
   out.town = townFor(p);
-  if (!forParcel) {
+  var ph = forParcel ? null : hits(candidates, p)[0];
+  if (ph) {
+    // The pin is inside a zoned parcel: score the parcel as a whole, exactly as the list does, so every point in it agrees.
+    var pm = measureParcel(ph), pr = score(pm.rep, true);
+    out.factors = pr.factors; out.market = pr.market; out.whole = true;
+    out.parcel = parcelInfo(ph.properties); out.parcel.m = pm;
+    out.notes = pinNotes(p, out);
+    out.caps = parcelCaps(pr.caps, out.parcel, pm);
+    // Two facts about the exact spot still apply: a building under the pin, or land in another use under the pin.
+    var nearB = buildingsNear(p, 60), useP = hits(inuse, p)[0];
+    if (nearB.some(function (n) { return n.d < Math.sqrt(n.b[2] / Math.PI) + 8; })) out.caps.push({ limit: CAP_BUILT, why: 'a building already stands at this exact point. The rest of the parcel is scored as a whole', key: 'built' });
+    else if (useP) out.caps.push({ limit: CAP_BUILT, why: 'this exact point is in use as a ' + useP.properties.u + (useP.properties.n ? ' (' + useP.properties.n + ')' : '') + ', according to OpenStreetMap. The rest of the parcel is scored as a whole', key: 'built' });
+  } else if (!forParcel) {
     var bc = builtCheck(p);
     if (bc.built) out.caps.push({ limit: CAP_BUILT, why: bc.why, key: 'built' });
-    var ph = hits(candidates, p)[0];
-    if (ph) { out.parcel = parcelInfo(ph.properties); out.parcel.m = measureParcel(ph); }
     out.notes = pinNotes(p, out);
     if (!bc.built && out.parcel && out.parcel.cn) out.caps.push({ limit: CAP_BUILT, why: 'construction of ' + out.parcel.cn.u + ' homes started on this parcel in ' + out.parcel.cn.y + ' (commencement notice)', key: 'built' });
   }
@@ -350,10 +417,9 @@ function rankCandidates() {
   candidates.forEach(function (f) {
     var q = f.properties, m = measureParcel(f);
     var r = score(m.rep, true); if (!r.inCork) return;
-    // the parcel as a whole decides flood and protected-site caps, not the single scoring point
-    r.caps = r.caps.filter(function (c) { return c.key !== 'flood' && c.key !== 'protected'; });
-    if (m.clearPct < 25) r.caps.push({ limit: CAP_RULED_OUT, why: 'only ' + m.clearPct + '% of the parcel is clear of flood extents, designated sites and steep ground', key: 'net' });
     var info = parcelInfo(q);
+    // the parcel as a whole decides the caps, not the single scoring point
+    r.caps = parcelCaps(r.caps, info, m);
     info.m = m; info.rep = m.rep; info.z = q.z; info.la = q.la; info.place = r.place ? r.place.name : ''; info.town = r.town;
     info.homes = m.homes;
     info.factors = r.factors.map(function (x) { return { key: x.key, score: x.score }; });
@@ -416,6 +482,7 @@ var steps = [
   ['points.json', function (d) { pts = d; }],
   ['market.json', function (d) { market = d; }],
   ['towns.json', function (d) { towns = d.towns || []; }],
+  ['grid.json', function (d) { grid = d; }],
   ['monuments.geojson', function (d) { d.features.forEach(function (f) { var c = f.geometry.coordinates, m = [c[0], c[1], f.properties.c, f.properties.s]; var k = Math.floor(c[0] / 0.004) + ',' + Math.floor(c[1] / 0.004); (mgrid[k] || (mgrid[k] = [])).push(m); }); }],
   ['nroads.json', function (d) { d.forEach(function (r) { var k = Math.floor(r[0] / 0.004) + ',' + Math.floor(r[1] / 0.004); (ngrid[k] || (ngrid[k] = [])).push(r); }); }],
   ['stateland.geojson', function (d) { stateland = index(d); }],

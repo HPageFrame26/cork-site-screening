@@ -7,7 +7,7 @@
   // The published copy decrypts the data first (gate.js) and hands over in-memory addresses for each file.
   var URLS = window.DATA_URLS || null;
   function dataUrl(file) { return (URLS && URLS[file]) || 'data/app/' + file; }
-  var WEIGHTS = { zoning: 30, flood: 15, waste: 15, supply: 10, market: 10, protected: 5, access: 10, planning: 5 };
+  var WEIGHTS = { zoning: 30, flood: 15, waste: 15, supply: 10, market: 10, protected: 5, access: 10, grid: 5, planning: 5 };
   var weights = load('weights') || JSON.parse(JSON.stringify(WEIGHTS));
   Object.keys(WEIGHTS).forEach(function (k) { if (!(k in weights)) weights[k] = WEIGHTS[k]; });
   var saved = load('sites') || [];
@@ -42,6 +42,7 @@
     ['planning', 'Housing scheme applications', ['planning-small', 'planning'], true, [[GOOD, 'Granted'], [BAD, 'Refused'], ['#8a8a8a', 'Other']]],
     ['starts', 'Construction started', ['starts'], true, [['#1c1c1c', 'Start notice']]],
     ['monuments', 'Recorded monuments', ['monuments'], false, [['#7a4a1e', 'Monument']]],
+    ['grid', 'Electricity substations', ['grid'], false, [[GOOD, '2 MVA or more spare'], [MID, 'Under 2 MVA'], [BAD, 'None spare']]],
     ['aerial', 'Aerial photo', ['aerial'], false, null],
     ['waste', 'Wastewater capacity', ['waste'], false, [[GOOD, 'Green'], [MID, 'Amber'], [BAD, 'Red']]]
   ];
@@ -53,7 +54,7 @@
     function src(name, file, opts) { var o = { type: 'geojson', data: dataUrl(file), tolerance: 0.5, buffer: 32 }; for (var k in opts) o[k] = opts[k]; map.addSource(name, o); }
     function add(layer) { map.addLayer(layer, firstLabel); }
     src('zoning', 'zoning.geojson'); src('flood', 'flood.geojson'); src('protected', 'protected.geojson');
-    src('boundary', 'boundary.geojson'); src('planning', 'planning.geojson', { buffer: 8 }); src('waste', 'waste.geojson'); src('candidates', 'candidates.geojson'); src('starts', 'starts.geojson'); src('monuments', 'monuments.geojson', { buffer: 8 });
+    src('boundary', 'boundary.geojson'); src('planning', 'planning.geojson', { buffer: 8 }); src('waste', 'waste.geojson'); src('candidates', 'candidates.geojson'); src('starts', 'starts.geojson'); src('monuments', 'monuments.geojson', { buffer: 8 }); src('grid', 'grid.geojson');
     map.addSource('ring', { type: 'geojson', data: { type: 'FeatureCollection', features: [] } });
 
     map.addSource('aerial', { type: 'raster', tileSize: 256, maxzoom: 19, attribution: 'Imagery: Esri, Maxar, Earthstar Geographics',
@@ -83,10 +84,12 @@
     map.addLayer({ id: 'starts', type: 'circle', source: 'starts', minzoom: 10,
       paint: { 'circle-color': '#ffffff', 'circle-stroke-color': '#1c1c1c', 'circle-stroke-width': 2.5,
         'circle-radius': ['interpolate', ['linear'], ['zoom'], 10, 2.5, 15, ['interpolate', ['linear'], ['get', 'u'], 5, 5, 300, 13]] } });
+    map.addLayer({ id: 'grid', type: 'circle', source: 'grid',
+      paint: { 'circle-radius': 6, 'circle-stroke-color': '#1c1c1c', 'circle-stroke-width': 1.5, 'circle-color': ['case', ['>=', ['get', 'f'], 2], GOOD, ['>', ['get', 'f'], 0], MID, BAD] } });
     map.addLayer({ id: 'waste', type: 'circle', source: 'waste',
       paint: { 'circle-radius': 6, 'circle-stroke-color': '#fff', 'circle-stroke-width': 1.5, 'circle-color': ['match', ['get', 'status'], 'Green', GOOD, 'Amber', MID, 'Red', BAD, '#888'] } });
     LAYERS.forEach(function (l) { setVisible(l[0], visible[l[0]]); });
-    ['planning', 'planning-small', 'waste', 'starts', 'monuments'].forEach(function (id) {
+    ['planning', 'planning-small', 'waste', 'starts', 'monuments', 'grid'].forEach(function (id) {
       map.on('mouseenter', id, function () { map.getCanvas().style.cursor = 'pointer'; });
       map.on('mouseleave', id, function () { map.getCanvas().style.cursor = ''; });
     });
@@ -108,11 +111,12 @@
 
   var popup = new maplibregl.Popup({ closeButton: false, offset: 10 });
   map.on('click', function (e) {
-    var ids = ['starts', 'planning', 'planning-small', 'waste', 'monuments'].filter(function (id) { return map.getLayer(id); });
+    var ids = ['starts', 'planning', 'planning-small', 'waste', 'monuments', 'grid'].filter(function (id) { return map.getLayer(id); });
     var f = map.queryRenderedFeatures(e.point, { layers: ids })[0];
     if (!f) { popup.remove(); drop(e.lngLat.lng, e.lngLat.lat); return; }
     var q = f.properties, html;
-    if (f.layer.id === 'monuments') html = '<b>' + esc(q.c) + '</b>Recorded monument ' + esc(q.s);
+    if (f.layer.id === 'grid') html = '<b>' + esc(q.n) + ' substation</b>' + esc(String(q.l).replace(' KV', ' kV')) + ', connection at ' + q.kv + ' kV<br>Spare firm capacity: ' + (+q.f).toFixed(1) + ' MVA this year, ' + (+q.f30).toFixed(1) + ' MVA in 2030<br>ESB Networks, indicative only';
+    else if (f.layer.id === 'monuments') html = '<b>' + esc(q.c) + '</b>Recorded monument ' + esc(q.s);
     else if (f.layer.id === 'starts') html = '<b>Construction started ' + q.y + '</b>' + q.u + ' homes' + (q.done ? ', ' + q.done + ' certified complete' : '') + (q.stalled ? '<br>No completions on record: possibly stalled' : '') + (q.town ? '<br>' + esc(q.town) : '') + (q.ref ? '<br>Planning ref ' + esc(q.ref) : '');
     else if (f.layer.id === 'waste') html = '<b>' + esc(q.s) + '</b>' + esc(q.plant) + ' (' + esc(q.reg) + ')<br>Wastewater capacity: ' + esc(q.status) + (q.project === 'Yes' ? '<br>Project planned or under way' : '');
     else html = '<b>' + esc(q.r) + ' · ' + DEC[q.d] + '</b>' + q.y + (q.u >= 2 ? ' · about ' + q.u + ' homes' : '') + (q.a ? ' · appeal: ' + esc(q.a.toLowerCase()) : '') + '<br>' + esc(q.t) + (q.l ? '<br><a href="' + esc(q.l) + '" target="_blank" rel="noopener">Open the planning file</a>' : '');
@@ -328,9 +332,9 @@
       '<tr><td>Developable area' + (lost.length ? '<br><span class="dim">' + lost.join(', ') + '</span>' : '') + '</td><td class="num">' + m.netHa.toFixed(2) + ' ha (' + m.clearPct + '%)</td></tr>' +
       '<tr><td>Density' + (o.band ? '<br><span class="dim">' + esc(o.band) + ' in the county plan</span>' : '<br><span class="dim">No band stated for this site, assumed</span>') + '</td><td class="num">' + o.lo + ' to ' + o.hi + ' per ha</td></tr>' +
       '<tr><td><b>Capacity</b></td><td class="num"><b>' + m.homesLo + ' to ' + m.homesHi + ' homes</b></td></tr>' +
-      '<tr><td>Status</td><td class="num">' + esc(status) + '</td></tr>' + extra + '</table>' +
+      '<tr><td>Status</td><td class="num">' + esc(status) + '</td></tr>' + (m.widthM != null ? '<tr><td>Mean width</td><td class="num">' + m.widthM + ' m' + (m.widthM < 20 ? ' (narrow strip)' : '') + '</td></tr>' : '') + extra + '</table>' +
       (o.text ? '<p class="dim"><b>' + esc(o.code) + ' in the plan:</b> ' + esc(o.text.replace(/([a-z])- ([a-z])/g, '$1$2')) + (planUrl ? ' <a href="' + planUrl + '" target="_blank" rel="noopener">Open the plan</a>' : '') + '</p>' : '') +
-      '<p class="dim">Measured at ' + m.n + ' points across the parcel. Capacity = developable area × density.</p></div>';
+      '<p class="dim">Measured at ' + m.n + ' points across the parcel. Capacity = developable area × density. The score is for the parcel as a whole, so every point inside it gives the same result.</p></div>';
   }
   function townHtml(t) {
     var warn = t.pct >= 100;
@@ -396,7 +400,7 @@
   function savedHtml() {
     if (!saved.length) return '';
     var labels = result && result.factors ? result.factors.map(function (f) { return [f.key, f.label]; }) :
-      [['zoning', 'Zoning'], ['flood', 'Flood'], ['waste', 'Wastewater'], ['supply', 'Water supply'], ['market', 'Market values'], ['protected', 'Protected sites'], ['access', 'Access and services'], ['planning', 'Comparable schemes']];
+      [['zoning', 'Zoning'], ['flood', 'Flood'], ['waste', 'Wastewater'], ['supply', 'Water supply'], ['market', 'Market values'], ['protected', 'Protected sites'], ['access', 'Access and services'], ['grid', 'Electricity'], ['planning', 'Comparable schemes']];
     var h = '<h2>Saved sites</h2><table class="cmp"><tr><th></th>' + saved.map(function (s, i) { return '<th><button data-go="' + i + '">' + esc(s.name) + '</button><br><button class="x" data-del="' + i + '">remove</button></th>'; }).join('') + '</tr>';
     h += '<tr class="total"><td>Score</td>' + saved.map(function (s) { return '<td style="color:' + band(s.final) + '">' + s.final + '</td>'; }).join('') + '</tr>';
     labels.forEach(function (l) { h += '<tr><td>' + l[1] + '</td>' + saved.map(function (s) { var v = s.marks[l[0]]; return '<td>' + (v == null ? '–' : v) + '</td>'; }).join('') + '</tr>'; });
